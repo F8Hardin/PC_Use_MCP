@@ -1,0 +1,6 @@
+mcp[cli]
+opencv-python
+python-dotenv
+requests
+uvicorn
+starlette

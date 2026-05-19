@@ -1,0 +1,95 @@
+Fate Desktop MCP — Process Notes
+==================================
+
+WHAT THIS IS
+------------
+This is the MCP (Model Context Protocol) server that gives Eva access to the
+Windows desktop environment. It runs on this machine and provides Eva with:
+  - Webcam image capture (every 30 seconds in background)
+  - Shell command execution
+  - Current date/time
+
+It must be running for Eva to see the room or run desktop commands.
+
+
+AUTOMATIC STARTUP (RECOMMENDED)
+--------------------------------
+startup.vbs is configured to launch server.py silently on login (no console
+window). Register it one of two ways:
+
+  Option A — Startup folder (no admin required):
+    Copy startup.vbs to your Startup folder:
+      %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\
+
+    Or run this in a normal terminal:
+      copy startup.vbs "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\"
+
+  Option B — Task Scheduler (admin required, more control):
+    Run in an admin terminal:
+      schtasks /Create /TN "Eva_DesktopMCP" /TR "wscript.exe \"C:\Users\fhard\GitHub\Project_Eva_AI\Fate_Desktop_MCP\startup.vbs\"" /SC ONLOGON /F
+
+    To remove it:
+      schtasks /Delete /TN "Eva_DesktopMCP" /F
+
+
+MANUAL START
+------------
+  Double-click start.bat
+    - Opens a visible console window
+    - Uses py -3.14 server.py
+    - Pauses on exit so you can see errors
+
+  Or from terminal:
+    cd C:\Users\fhard\GitHub\Project_Eva_AI\Fate_Desktop_MCP
+    py -3.14 server.py
+
+
+CHECK IF THE PROCESS IS RUNNING
+---------------------------------
+  In terminal:
+    tasklist | findstr python
+
+  Check if the port is active (default 8001):
+    netstat -ano | findstr :8001
+
+  Or ping the MCP endpoint directly:
+    curl http://localhost:8001/mcp
+
+
+STOP THE PROCESS
+----------------
+  If started via start.bat: close the console window or press Ctrl+C
+
+  If started silently via startup.vbs (no window):
+    taskkill /F /IM python.exe /T
+
+  Note: this kills ALL python.exe processes on the machine. If other Python
+  processes are running that you want to keep, find the specific PID first:
+    tasklist | findstr python
+    taskkill /F /PID <pid>
+
+
+CONFIGURATION
+-------------
+  Settings are in .env (copy from .env.example if missing):
+    MCP_HOST=0.0.0.0
+    MCP_PORT=8001
+    CAPTURE_INTERVAL_SECONDS=30   (how often webcam captures)
+    imageStorageMax=10            (max frames kept in captures/)
+
+
+TROUBLESHOOTING
+---------------
+  "Address already in use" on start:
+    Another instance is already running. Check with netstat above and kill it.
+
+  Eva says she can't see anything / MCP tools missing:
+    Confirm this server is running and DESKTOP_MCP_URL in the main .env
+    points to this machine (e.g. http://100.66.121.29:8001/mcp).
+
+  Camera not capturing:
+    Ensure OpenCV can access the webcam. Check that no other app has it locked.
+    Run: py -3.14 server.py and watch for camera error output.
+
+  startup.vbs silently fails on login:
+    Run start.bat manually to see the error output in the console window.
