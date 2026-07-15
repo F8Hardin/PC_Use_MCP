@@ -1,7 +1,8 @@
 """
-Fate Desktop MCP Server
-Exposes Fate's desktop capabilities to Eva via MCP HTTP transport.
-Run on Fate's Windows machine; Eva connects from her Ubuntu server.
+PC Use MCP Server (portable)
+Exposes the host machine's capabilities to Eva via MCP HTTP transport.
+The same server runs on any host (Windows desktop, Ubuntu server, ...);
+clients connect over HTTP. See NOTES.txt for the security/hardening plan.
 """
 
 import sys
@@ -32,6 +33,90 @@ port = int(os.getenv("MCP_PORT", "8001"))
 CAMERA_SEND_COUNT = int(os.getenv("CAMERA_SEND_COUNT", "3"))
 lmstudio_url = os.getenv("LMSTUDIO_URL", "http://localhost:1234/v1/")
 vision_model = os.getenv("VISION_MODEL", "qwen/qwen3.5-9b")
+
+# --- Layer 0: network + auth hardening (all backward-compatible) -------------
+# MCP_AUTH_TOKEN: if set, every request must send `Authorization: Bearer <token>`.
+#   If unset, auth is disabled (legacy behavior) and a loud warning is printed.
+# MCP_ALLOWED_ORIGINS: comma-separated CORS allowlist. Defaults to "*" (legacy).
+# Recommended production posture: set MCP_HOST=127.0.0.1 (or the tailnet IP),
+#   set MCP_AUTH_TOKEN, and set MCP_ALLOWED_ORIGINS to the client origin(s).
+AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN", "").strip()
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("MCP_ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+# Paths that must stay reachable without a token (health/liveness probes only).
+AUTH_EXEMPT_PATHS = tuple(
+    p.strip() for p in os.getenv("MCP_AUTH_EXEMPT_PATHS", "/health").split(",") if p.strip()
+)
+
+# --- Layer 1: least-privilege guards (all backward-compatible) ---------------
+# FILE_ALLOWED_ROOTS: os.pathsep-separated absolute dirs the file tools may touch.
+#   Empty (default) = no confinement (legacy: any path the process can reach).
+# BLOCK_PRIVATE_IPS: "1" makes web_fetch/http_request refuse private/loopback/
+#   link-local targets (SSRF guard). Default "0" (legacy). HTTP_ALLOWED_HOSTS is
+#   an explicit exception list (e.g. the LM Studio host) checked before blocking.
+FILE_ALLOWED_ROOTS = [
+    os.path.realpath(p.strip())
+    for p in os.getenv("FILE_ALLOWED_ROOTS", "").split(os.pathsep)
+    if p.strip()
+]
+BLOCK_PRIVATE_IPS = os.getenv("BLOCK_PRIVATE_IPS", "0").strip() in ("1", "true", "True")
+HTTP_ALLOWED_HOSTS = {
+    h.strip().lower()
+    for h in os.getenv("HTTP_ALLOWED_HOSTS", "").split(",")
+    if h.strip()
+}
+
+
+def _check_path(path: str):
+    """Return (canonical_path, None) if allowed, or (None, error_str) if denied.
+
+    Canonicalizes with realpath (resolves symlinks and ..) then requires the
+    result to be inside one of FILE_ALLOWED_ROOTS. No-op when the allowlist is
+    empty (legacy behavior)."""
+    canonical = os.path.realpath(path)
+    if not FILE_ALLOWED_ROOTS:
+        return canonical, None
+    for root in FILE_ALLOWED_ROOTS:
+        if canonical == root or canonical.startswith(root + os.sep):
+            return canonical, None
+    return None, (
+        f"Permission denied: {path!r} is outside the allowed roots. "
+        f"Allowed: {FILE_ALLOWED_ROOTS}. "
+        f"(An operator can grant this path — see the permission broker.)"
+    )
+
+
+def _check_url(url: str):
+    """Return None if the URL may be fetched, or an error string if blocked.
+
+    When BLOCK_PRIVATE_IPS is on, resolves the host and rejects loopback,
+    private, link-local, and reserved ranges unless the host is explicitly in
+    HTTP_ALLOWED_HOSTS. No-op when BLOCK_PRIVATE_IPS is off (legacy)."""
+    if not BLOCK_PRIVATE_IPS:
+        return None
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return f"Blocked: only http/https URLs allowed, got scheme {parsed.scheme!r}."
+    hostname = parsed.hostname or ""
+    if hostname.lower() in HTTP_ALLOWED_HOSTS:
+        return None
+    try:
+        infos = socket.getaddrinfo(hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
+    except Exception as e:
+        return f"Blocked: could not resolve host {hostname!r}: {e}"
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            return (
+                f"Blocked: {hostname} resolves to non-public address {ip}. "
+                f"Add it to HTTP_ALLOWED_HOSTS to allow."
+            )
+    return None
+
+
 mcp = FastMCP("Fate Desktop", host=host, port=port)
 
 # ---------------------------------------------------------------------------
@@ -297,6 +382,9 @@ def read_file(path: str) -> str:
     path should be an absolute Windows path, e.g. 'C:\\Users\\fhard\\notes.txt'.
     Returns the file contents as text, or an error message if the file cannot be read.
     """
+    path, err = _check_path(path)
+    if err:
+        return err
     try:
         with open(path, 'r', encoding='utf-8', errors='replace') as f:
             return f.read()
@@ -317,6 +405,9 @@ def write_file(path: str, content: str, append: bool = False) -> str:
     append: if True, appends to existing file; if False (default), overwrites
     Returns 'OK' on success or an error message.
     """
+    path, err = _check_path(path)
+    if err:
+        return err
     try:
         mode = 'a' if append else 'w'
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -336,6 +427,9 @@ def list_dir(path: str) -> str:
     path: absolute Windows path, e.g. 'C:\\Users\\fhard\\Documents'
     Returns a JSON array of entries with name, type (file/dir), and size.
     """
+    path, err = _check_path(path)
+    if err:
+        return err
     try:
         entries = []
         for entry in os.scandir(path):
@@ -444,16 +538,66 @@ def get_datetime() -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
+import hmac
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+
+
+class BearerAuthMiddleware(BaseHTTPMiddleware):
+    """Require `Authorization: Bearer <MCP_AUTH_TOKEN>` on every request.
+
+    No-op when MCP_AUTH_TOKEN is unset (legacy behavior). Uses a constant-time
+    compare to avoid leaking the token via timing. CORS preflight (OPTIONS) and
+    configured exempt paths (e.g. /health) are allowed through unauthenticated.
+    """
+
+    def __init__(self, app, token: str, exempt_paths: tuple = ()):
+        super().__init__(app)
+        self.token = token
+        self.exempt_paths = exempt_paths
+
+    async def dispatch(self, request, call_next):
+        if request.method == "OPTIONS" or request.url.path in self.exempt_paths:
+            return await call_next(request)
+        auth = request.headers.get("authorization", "")
+        provided = auth[7:] if auth.lower().startswith("bearer ") else ""
+        if not (provided and hmac.compare_digest(provided, self.token)):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        return await call_next(request)
+
+
 if __name__ == "__main__":
-    print(f"Fate Desktop MCP server starting on {host}:{port}")
+    print(f"PC Use MCP server starting on {host}:{port}")
+
     app = mcp.streamable_http_app()
+
+    # Order matters: CORS added last runs first (outermost), so preflight and
+    # CORS headers are handled before the auth check rejects anything.
+    app.add_middleware(
+        BearerAuthMiddleware,
+        token=AUTH_TOKEN,
+        exempt_paths=AUTH_EXEMPT_PATHS,
+    )
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=ALLOWED_ORIGINS,
         allow_methods=["*"],
         allow_headers=["*"],
         expose_headers=["Mcp-Session-Id"],
     )
+
+    if AUTH_TOKEN:
+        print(f"[MCP] Bearer auth ENABLED (exempt: {', '.join(AUTH_EXEMPT_PATHS) or 'none'})")
+    else:
+        print("[MCP] ⚠ WARNING: MCP_AUTH_TOKEN not set — auth DISABLED. "
+              "Anyone who can reach this port has full host control. "
+              "Set MCP_AUTH_TOKEN and bind MCP_HOST to localhost/tailnet for production.")
+    if ALLOWED_ORIGINS == ["*"]:
+        print("[MCP] ⚠ WARNING: CORS allow_origins is '*'. Set MCP_ALLOWED_ORIGINS to lock it down.")
+    if host == "0.0.0.0":
+        print("[MCP] ⚠ WARNING: bound to 0.0.0.0 (all interfaces). "
+              "Prefer MCP_HOST=127.0.0.1 or the tailnet IP.")
+
     while True:
         try:
             uvicorn.run(app, host=host, port=port)

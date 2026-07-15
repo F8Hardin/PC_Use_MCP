@@ -1,15 +1,39 @@
-Fate Desktop MCP — Process Notes
+PC Use MCP — Process Notes
 ==================================
 
 WHAT THIS IS
 ------------
-This is the MCP (Model Context Protocol) server that gives Eva access to the
-Windows desktop environment. It runs on this machine and provides Eva with:
-  - Webcam image capture (every 30 seconds in background)
-  - Shell command execution
-  - Current date/time
+This is a PORTABLE MCP (Model Context Protocol) server that gives Eva control of
+whatever machine it is running on. It is NOT Windows-specific — the same
+server.py runs on any host with Python + the deps in requirements.txt.
 
-It must be running for Eva to see the room or run desktop commands.
+Current deployments:
+  - Fate's Windows desktop  (C:\Users\fhard\GitHub\PC_Use_MCP\)
+  - f8homeserver, Ubuntu     (~/CloudSystems/PC_Use_MCP/, runs from ./venv,
+                              backs the ubuntu_server_pc_use_mcp connector)
+
+On each host it provides Eva with:
+  - Webcam image capture (every 30 seconds in background) + vision description
+  - Shell command execution (run_command, run_command_bg / read_job_output)
+  - In-process Python execution (python_exec)
+  - File access (read_file, write_file, list_dir)
+  - Networking (web_fetch, http_request)
+  - Date/time and IP geolocation (get_datetime, get_location)
+
+It must be running on a given host for Eva to see/act on that host. The tool
+docstrings say "Windows desktop" for historical reasons — on the Linux
+deployment the same tools operate on the Linux filesystem and /bin/sh.
+
+SECURITY / SANDBOXING
+---------------------
+This server grants unauthenticated, un-sandboxed control of the host to anyone
+who can reach its port. A layered hardening plan is in progress (localhost bind
++ bearer-token auth + CORS lockdown; path allowlist + SSRF guard; containerize
+the runtime via Docker/Apptainer with bind-mounted allowed dirs only; and an
+"allow once / always allow" permission broker persisted per instance). See the
+Obsidian vault note [[PC Use MCP]] for the full plan and status before changing
+deployment. Until it lands, only expose the port on localhost / the tailnet,
+never the open LAN.
 
 
 AUTOMATIC STARTUP (RECOMMENDED)
