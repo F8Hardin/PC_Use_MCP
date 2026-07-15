@@ -534,6 +534,43 @@ def get_datetime() -> str:
     return datetime.now().isoformat()
 
 
+@mcp.tool()
+def get_location() -> str:
+    """
+    Returns EVA's current physical location by geolocating the server's public IP.
+    Provides city, region, country, coordinates, timezone, ISP, and public IP address.
+    Useful for location-aware tasks and answering 'where are you?' questions.
+    No arguments needed — automatically detects the server's outbound IP.
+    """
+    import socket
+    try:
+        resp = requests.get("http://ip-api.com/json", timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("status") != "success":
+            return json.dumps({"error": "Geolocation lookup failed", "details": data})
+        hostname = socket.gethostname()
+        try:
+            local_ip = socket.gethostbyname(hostname)
+        except Exception:
+            local_ip = "unknown"
+        return json.dumps({
+            "public_ip": data.get("query"),
+            "city": data.get("city"),
+            "region": data.get("regionName"),
+            "country": data.get("country"),
+            "country_code": data.get("countryCode"),
+            "lat": data.get("lat"),
+            "lon": data.get("lon"),
+            "timezone": data.get("timezone"),
+            "isp": data.get("isp"),
+            "hostname": hostname,
+            "local_ip": local_ip,
+        })
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
