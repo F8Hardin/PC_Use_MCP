@@ -7,6 +7,7 @@ clients connect over HTTP. See NOTES.txt for the security/hardening plan.
 
 import sys
 import os
+import socket
 import io
 import base64
 import glob
@@ -117,7 +118,7 @@ def _check_url(url: str):
     return None
 
 
-mcp = FastMCP("Fate Desktop", host=host, port=port)
+mcp = FastMCP(os.getenv("MCP_SERVER_NAME", os.getenv("COMPUTERNAME") or socket.gethostname()), host=host, port=port)
 
 # ---------------------------------------------------------------------------
 # Camera — always-on background capture
