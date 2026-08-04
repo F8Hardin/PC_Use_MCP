@@ -11,9 +11,12 @@ Design notes
   (~130 notes, <5 MB) a Python scan is already sub-second, and dropping the API
   means the tools keep working while Obsidian is closed. Fewer moving parts.
 
-* **Reads are wide, writes are narrow.** The agent may read the whole vault but
-  may only write inside its own namespace (VAULT_AGENT_NS, plus Inbox/). This is
-  enforced here rather than in a prompt, because a prompt rule is a suggestion.
+* **Reads are wide, writes are narrow, and the narrowing is negotiable.** The
+  agent may read the whole vault but writes only inside its own namespace
+  (VAULT_AGENT_NS, plus Inbox/) unless the operator grants a specific path in
+  the grants file. Enforced here rather than in a prompt, because a prompt rule
+  is a suggestion. Grants are re-read per write, so permission can be given
+  mid-conversation without a restart.
 
 * **Writes are structured, not freeform.** vault_write_note builds the note --
   frontmatter, timestamps, ownership -- from arguments. A small local model
@@ -38,6 +41,15 @@ AGENT_OWNER = os.getenv("VAULT_AGENT_OWNER", AGENT_NS.lower()).strip()
 # Folders the agent may write to, beyond its own namespace.
 SHARED_WRITE = ("Inbox",)
 
+# Paths outside the namespace that the operator has granted. Read fresh on every
+# write attempt rather than cached at startup, so a grant takes effect
+# immediately instead of needing a server restart -- the point is to be able to
+# say "yes, go ahead" mid-conversation. This is the minimal form of the
+# "allow once / always allow" permission broker described in NOTES.txt.
+GRANTS_FILE = os.getenv("VAULT_GRANTS_FILE", "").strip() or (
+    os.path.join(VAULT_ROOT, ".vault_grants") if VAULT_ROOT else ""
+)
+
 VALID_FILECLASS = (
     "PersonFile", "PetFile", "OrgFile", "ProjectFile", "ToolFile", "ServerFile",
     "RepoFile", "SkillFile", "SessionFile", "AnalysisFile", "MocFile", "ServiceFile",
@@ -52,8 +64,11 @@ MAX_BODY_RETURN = 20000
 # ---------------------------------------------------------------------------
 
 def _rel(path: str) -> str:
-    """Normalize a vault-relative path to forward slashes, no leading slash."""
-    return path.replace("\\", "/").strip("/")
+    """Normalize a vault-relative path: forward slashes, no surrounding slashes
+    or whitespace. Stripping whitespace matters -- paths arrive from grants-file
+    lines and model output, both of which carry stray newlines and spaces that
+    would otherwise silently fail every comparison."""
+    return path.replace("\\", "/").strip().strip("/").strip()
 
 
 def _resolve(path: str):
@@ -74,30 +89,90 @@ def _resolve(path: str):
     return target, None
 
 
-def _writable(path: str):
-    """(canonical_rel, None) if the agent may write here, else (None, error).
+def _load_grants():
+    """Vault-relative path prefixes the operator has granted write access to.
 
-    Matching is case-insensitive so a model writing 'eva/' is not denied a path
-    that is genuinely inside its namespace -- but the returned path is rewritten
-    to the canonical casing. Permitting the lowercase spelling as-is would be
-    harmless on Windows and quietly wrong on a case-sensitive filesystem, where
-    it would fork a second 'eva/' folder alongside 'Eva/'.
+    One per line, '#' comments and blanks ignored. A line may name a folder
+    ('Sessions') or a single note ('Projects/Eva AI.md'). Missing file = no
+    grants, which is the correct default.
+    """
+    if not GRANTS_FILE or not os.path.isfile(GRANTS_FILE):
+        return []
+    try:
+        with open(GRANTS_FILE, encoding="utf-8") as f:
+            return [
+                _rel(line.split("#", 1)[0]).lower()
+                for line in f
+                if line.split("#", 1)[0].strip()
+            ]
+    except OSError:
+        return []
+
+
+def _writable(path: str):
+    """(canonical_rel, error, grant) -- grant is the line that authorized this.
+
+    Allowed in three cases: inside the agent's own namespace, inside a folder in
+    SHARED_WRITE, or covered by an operator grant. The first two are standing
+    permissions and return grant=None. The third returns the matching grant line,
+    which the caller must pass to _consume_grant() once the write succeeds --
+    grants are single-use.
+
+    Namespace matching is case-insensitive so a model writing 'eva/' is not
+    denied a path that is genuinely inside its namespace -- but the returned path
+    is rewritten to the canonical casing. Permitting the lowercase spelling as-is
+    would be harmless on Windows and quietly wrong on a case-sensitive
+    filesystem, where it would fork a second 'eva/' folder alongside 'Eva/'.
     """
     rel = _rel(path)
     parts = rel.split("/")
     top = parts[0].lower()
-    canonical = None
+
     if top == AGENT_NS.lower():
-        canonical = AGENT_NS
-    else:
-        canonical = next((s for s in SHARED_WRITE if s.lower() == top), None)
-    if canonical is None:
-        return None, (
-            f"Write denied: {rel!r} is outside your namespace. You may write under "
-            f"'{AGENT_NS}/' and append to {list(SHARED_WRITE)}. Everything else in the "
-            f"vault is readable but not yours to modify."
-        )
-    return "/".join([canonical] + parts[1:]), None
+        return "/".join([AGENT_NS] + parts[1:]), None, None
+    shared = next((s for s in SHARED_WRITE if s.lower() == top), None)
+    if shared:
+        return "/".join([shared] + parts[1:]), None, None
+
+    low = rel.lower()
+    for g in _load_grants():
+        if low == g or low.startswith(g + "/") or low == g + ".md":
+            return rel, None, g
+
+    return None, (
+        f"Write denied: {rel!r} is outside your namespace and has not been granted. "
+        f"You may always write under '{AGENT_NS}/' and append to {list(SHARED_WRITE)}. "
+        f"To edit this note, ask Fate to grant it -- he adds a line to "
+        f"{os.path.basename(GRANTS_FILE) or '.vault_grants'} in the vault root. "
+        f"Say which path you want and why; do not try to route around this. "
+        f"A grant covers one write only, so ask again for the next one."
+    ), None
+
+
+def _consume_grant(grant: str) -> bool:
+    """Remove a used grant from the grants file. Returns True if it was removed.
+
+    Grants are single-use: one grant authorizes one write, then it is spent. The
+    operator re-grants for the next one. Called only AFTER the write succeeds, so
+    a failed write does not burn the permission.
+
+    Removes the first matching line and leaves comments and other grants intact.
+    """
+    if not grant or not GRANTS_FILE or not os.path.isfile(GRANTS_FILE):
+        return False
+    try:
+        with open(GRANTS_FILE, encoding="utf-8") as f:
+            lines = f.readlines()
+        for i, line in enumerate(lines):
+            body = line.split("#", 1)[0]
+            if body.strip() and _rel(body).lower() == grant:
+                del lines[i]
+                with open(GRANTS_FILE, "w", encoding="utf-8") as f:
+                    f.writelines(lines)
+                return True
+    except OSError:
+        return False
+    return False
 
 
 def _iter_notes():
@@ -402,7 +477,7 @@ def register_vault_tools(mcp):
         tags = [str(t).strip().lower().lstrip("#") for t in (tags or []) if str(t).strip()]
 
         rel = _rel(folder) if folder else AGENT_NS
-        rel, werr = _writable(f"{rel}/{title}.md")
+        rel, werr, grant = _writable(f"{rel}/{title}.md")
         if werr:
             return _err(werr)
         ap, err = _resolve(rel)
@@ -443,7 +518,13 @@ def register_vault_tools(mcp):
                 f.write(_compose(fm, f"# {title}\n\n{body}\n" if not body.startswith("#") else body + "\n"))
         except OSError as e:
             return _err(f"Could not write {_rel(rel)!r}: {e}")
-        return json.dumps({"ok": True, "path": _rel(rel), "frontmatter": fm, "links": links}, ensure_ascii=False)
+        out = {"ok": True, "path": _rel(rel), "frontmatter": fm, "links": links}
+        if grant and _consume_grant(grant):
+            out["grant_consumed"] = (
+                f"The grant for {grant!r} was single-use and is now spent. "
+                f"Ask Fate again before writing outside your namespace next time."
+            )
+        return json.dumps(out, ensure_ascii=False)
 
     @mcp.tool()
     def vault_append(path: str, text: str, heading: str = "") -> str:
@@ -460,7 +541,7 @@ def register_vault_tools(mcp):
         """
         if not (text or "").strip():
             return _err("Nothing to append.")
-        path, werr = _writable(path)
+        path, werr, grant = _writable(path)
         if werr:
             return _err(werr)
         ap, err = _resolve(path)
@@ -505,7 +586,13 @@ def register_vault_tools(mcp):
                 f.write(_compose(fm, body))
         except OSError as e:
             return _err(f"Could not write {_rel(path)!r}: {e}")
-        return json.dumps({"ok": True, "path": _rel(path), "appended_to": where}, ensure_ascii=False)
+        out = {"ok": True, "path": _rel(path), "appended_to": where}
+        if grant and _consume_grant(grant):
+            out["grant_consumed"] = (
+                f"The grant for {grant!r} was single-use and is now spent. "
+                f"Ask Fate again before writing outside your namespace next time."
+            )
+        return json.dumps(out, ensure_ascii=False)
 
     @mcp.tool()
     def vault_list(folder: str = "") -> str:
@@ -532,6 +619,7 @@ def register_vault_tools(mcp):
                 notes.append({"path": f"{rel}/{name}" if rel else name, "title": name[:-3]})
         return json.dumps({"folder": rel or "/", "folders": folders, "notes": notes,
                            "writable": _writable(rel or AGENT_NS)[1] is None}, ensure_ascii=False)
+        # note: index [1] is the error slot; [2] is the grant, irrelevant for a listing
 
     print(f"[vault] tools registered - root={VAULT_ROOT} namespace={AGENT_NS}/ owner={AGENT_OWNER}")
     return True
