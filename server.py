@@ -573,6 +573,18 @@ def get_location() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Obsidian vault — registered only when VAULT_ROOT points at a vault on this
+# machine, so an instance running without one simply does not expose the tools.
+# ---------------------------------------------------------------------------
+
+try:
+    from vault import register_vault_tools
+    register_vault_tools(mcp)
+except Exception as _e:
+    print(f"[vault] tools unavailable: {_e}")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
