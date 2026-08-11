@@ -55,6 +55,17 @@ VALID_FILECLASS = (
     "RepoFile", "SkillFile", "SessionFile", "AnalysisFile", "MocFile", "ServiceFile",
 )
 
+# Master nodes. Every note has to reach the graph, so one whose supplied links
+# all dangle gets wired to the index for its folder, deepest match first, with
+# the agent's home note as the floor. This is enforcement, not advice: the model
+# that forgets to link is the same model that would have forgotten to read a
+# rule telling it to link.
+HUB_NOTE = os.getenv("VAULT_AGENT_HUB", "").strip() or AGENT_NS.lower()
+FOLDER_HUBS = {
+    f"{AGENT_NS}/Memory": f"{AGENT_NS}'s Memory",
+    f"{AGENT_NS}/Journal": f"{AGENT_NS}'s Memory",
+}
+
 MAX_SNIPPET = 240
 MAX_BODY_RETURN = 20000
 
@@ -191,6 +202,8 @@ def _iter_notes():
 
 _FM = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.S)
 _LINK = re.compile(r"\[\[([^\]|#]+)")
+_FENCE = re.compile(r"^```.*?^```", re.S | re.M)
+_CODESPAN = re.compile(r"`[^`\n]*`")
 
 
 def _split(text: str):
@@ -212,7 +225,14 @@ def _compose(fm: dict, body: str) -> str:
 
 
 def _links_in(text: str):
-    """Wikilink targets, de-duplicated, order preserved."""
+    """Wikilink targets, de-duplicated, order preserved.
+
+    Code spans and fenced blocks are stripped first, matching Obsidian: a
+    wikilink inside backticks is displayed as text and creates no graph edge.
+    Without this, a note that *documents* a malformed link acquires it.
+    """
+    text = _FENCE.sub(" ", text)
+    text = _CODESPAN.sub(" ", text)
     seen, out = set(), []
     for raw in _LINK.findall(text):
         t = raw.strip()
@@ -224,6 +244,49 @@ def _links_in(text: str):
 
 def _title_of(rel: str) -> str:
     return os.path.basename(rel)[:-3]
+
+
+# Keys a model plausibly wraps a note title in when it sends an object instead
+# of a string. Ordered by how unambiguous each one is.
+_TITLE_KEYS = ("title", "name", "note", "target", "link", "tag", "path", "value")
+
+
+def _as_title(v) -> str:
+    """Coerce one links/tags element to a plain note title.
+
+    Small local models routinely send `[{"title": "Moltbook"}]` where the schema
+    wants `["Moltbook"]`. MCP declares both parameters as a bare `list`, so
+    nothing rejects it, and the old `str(v)` baked `{'title': 'Moltbook'}`
+    straight into a wikilink. The result is a note that *looks* linked, passes
+    the "at least one link" check, and is in fact an orphan pointing at a note
+    that can never exist -- exactly the failure this module was written to
+    prevent, arriving through the door left open for it.
+
+    Also accepts a path (`Projects/Eva AI.md`) and reduces it to the title, since
+    that is the other shape models reach for. Returns "" for anything it cannot
+    read, so the caller drops it rather than writing a garbage link.
+    """
+    if isinstance(v, dict):
+        for k in _TITLE_KEYS:
+            if isinstance(v.get(k), str) and v[k].strip():
+                v = v[k]
+                break
+        else:
+            # Unrecognized shape: salvage it only if there is exactly one string
+            # in it, so we never silently pick the wrong field.
+            vals = [x for x in v.values() if isinstance(x, str) and x.strip()]
+            if len(vals) != 1:
+                return ""
+            v = vals[0]
+    elif isinstance(v, (list, tuple)):
+        return _as_title(v[0]) if len(v) == 1 else ""
+
+    if not isinstance(v, str):
+        return ""
+    t = v.strip().strip("[]").strip()
+    if t.lower().endswith(".md"):
+        t = _title_of(_rel(t))
+    return t.strip()
 
 
 def _read(ap: str) -> str:
@@ -464,17 +527,19 @@ def register_vault_tools(mcp):
             return _err(f"fileClass must be one of {list(VALID_FILECLASS)}, got {fileClass!r}.")
         if isinstance(links, str):
             links = [links]
-        links = [str(l).strip().strip("[]") for l in (links or []) if str(l).strip()]
+        links = [t for t in (_as_title(l) for l in (links or [])) if t]
         if not links:
             return _err(
                 "At least one link is required. Name a related note in `links` -- "
                 "a hub like 'Eva AI', the person involved, or the project it touches. "
+                "Pass plain title strings: links=['Moltbook', 'Eva AI']. Not objects, "
+                "not {'title': 'Moltbook'}. "
                 "Use vault_search first if you are unsure what exists; a link to a note "
                 "that does not exist yet is fine and marks it as worth writing."
             )
         if isinstance(tags, str):
             tags = [tags]
-        tags = [str(t).strip().lower().lstrip("#") for t in (tags or []) if str(t).strip()]
+        tags = [t.lower().lstrip("#") for t in (_as_title(x) for x in (tags or [])) if t]
 
         rel = _rel(folder) if folder else AGENT_NS
         rel, werr, grant = _writable(f"{rel}/{title}.md")
@@ -504,6 +569,22 @@ def register_vault_tools(mcp):
         fm["updated"] = today
         fm["tags"] = tags or [AGENT_OWNER]
 
+        # Reaching the graph means linking to a note that actually exists. A link
+        # to a not-yet-written note is legitimate and stays, but it cannot be the
+        # note's only tie -- that is an orphan wearing a link. If every supplied
+        # link dangles, wire it to its folder's master node as well.
+        existing = {_title_of(r) for _, r in _iter_notes()}
+        unresolved = [l for l in links if l not in existing]
+        folder_rel = os.path.dirname(_rel(rel))
+        hub = next(
+            (h for f, h in FOLDER_HUBS.items() if folder_rel.lower() == f.lower()),
+            HUB_NOTE,
+        )
+        hubbed = None
+        if len(unresolved) == len(links) and hub not in links:
+            links.append(hub)
+            hubbed = hub
+
         # Guarantee the links are actually present in the note text, so the graph
         # sees them even if the model forgot to write them into the body.
         body = (body or "").strip()
@@ -519,6 +600,21 @@ def register_vault_tools(mcp):
         except OSError as e:
             return _err(f"Could not write {_rel(rel)!r}: {e}")
         out = {"ok": True, "path": _rel(rel), "frontmatter": fm, "links": links}
+        if unresolved:
+            out["links_unresolved"] = unresolved
+            out["note"] = (
+                f"These links point at notes that do not exist yet: {unresolved}. "
+                f"That is fine if you meant to flag them as worth writing. If you "
+                f"meant an existing note, the title is probably spelled differently "
+                f"-- vault_search for it and rewrite with the real title."
+            )
+        if hubbed:
+            out["hub_added"] = hubbed
+            out["note"] = (
+                f"Every link you gave was to a note that does not exist, which would "
+                f"have left this note unreachable, so it was also linked to [[{hubbed}]]. "
+                f"Link to a real note next time -- vault_search first to get the title right."
+            )
         if grant and _consume_grant(grant):
             out["grant_consumed"] = (
                 f"The grant for {grant!r} was single-use and is now spent. "
