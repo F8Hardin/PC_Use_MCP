@@ -751,21 +751,38 @@ if GUI_AVAILABLE:
         pyautogui.write(text, interval=interval)
         return f"Typed {len(text)} chars"
 
+    # Common shorthand -> the name pyautogui.KEYBOARD_KEYS actually recognizes.
+    # 'cmd' in particular is the name most callers reach for on macOS and
+    # pyautogui silently doesn't have it -- without this map (and the
+    # validation below) that key is dropped from the chord with no error.
+    _KEY_ALIASES = {
+        'cmd': 'command', 'super': 'command', 'meta': 'command',
+        'opt': 'option', 'alt': 'option' if sys.platform == 'darwin' else 'alt',
+        'ctl': 'ctrl', 'return': 'enter', 'esc': 'escape',
+        'del': 'delete', 'ins': 'insert', 'pgup': 'pageup', 'pgdn': 'pagedown',
+    }
+
     @mcp.tool()
     def press_keys(keys: str, presses: int = 1) -> str:
         """
         Press a key or a chord. Use '+' for combos: 'enter', 'ctrl+s',
-        'ctrl+shift+esc', 'alt+tab', 'win'. Repeat with `presses`.
+        'ctrl+shift+esc', 'alt+tab', 'win'/'cmd' (mapped to the platform's
+        modifier). Repeat with `presses`.
         """
-        parts = [k.strip().lower() for k in keys.split('+') if k.strip()]
-        if not parts:
+        raw = [k.strip().lower() for k in keys.split('+') if k.strip()]
+        if not raw:
             return "Error: no keys given"
+        parts = [_KEY_ALIASES.get(k, k) for k in raw]
+        unknown = [p for p in parts if p not in pyautogui.KEYBOARD_KEYS]
+        if unknown:
+            return (f"Error: unrecognized key(s) {unknown} in '{keys}'. "
+                    f"See pyautogui.KEYBOARD_KEYS for valid names.")
         for _ in range(max(1, presses)):
             if len(parts) == 1:
                 pyautogui.press(parts[0])
             else:
                 pyautogui.hotkey(*parts)
-        return f"Pressed '{keys}' x{presses}"
+        return f"Pressed '{keys}' -> {'+'.join(parts)} x{presses}"
 
 
 # ---------------------------------------------------------------------------
