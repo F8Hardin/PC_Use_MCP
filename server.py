@@ -12,6 +12,8 @@ import io
 import base64
 import glob
 import json
+import shlex
+import signal
 import subprocess
 import threading
 import time
@@ -27,7 +29,7 @@ load_dotenv()
 if hasattr(sys.stdout, 'buffer'):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 
 host = os.getenv("MCP_HOST", "0.0.0.0")
 port = int(os.getenv("MCP_PORT", "8001"))
@@ -279,30 +281,102 @@ def get_images(after: str = "", before: str = "", count: int = 3) -> str:
 # Command line
 # ---------------------------------------------------------------------------
 
+# Characters that mean the command genuinely needs a shell to interpret it.
+# Anything without them is run with shell=False so there is no intermediate
+# cmd.exe/sh to lose track of.
+_SHELL_METACHARS = ('|', '&', '>', '<', ';', '$', '`', '*', '?', '(', ')', '{', '}', '\n', '"', "'")
+
+
+def _needs_shell(command: str) -> bool:
+    return any(ch in command for ch in _SHELL_METACHARS)
+
+
+def _new_group_kwargs() -> dict:
+    """Put the child in its own process group so the whole tree is killable."""
+    if os.name == 'nt':
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def _kill_tree(proc) -> None:
+    """Kill the child *and every descendant*.
+
+    This is the fix for the hang that wedged the desktop server: with
+    shell=True the direct child is cmd.exe and anything it spawns (notepad, a
+    GUI app) is a grandchild holding an inherited handle on the stdout/stderr
+    pipes. Killing only cmd.exe leaves that grandchild holding the write end
+    open, so draining the pipe blocks forever and the worker thread is stuck
+    permanently -- not for the timeout, but for the life of the process.
+    """
+    try:
+        if os.name == 'nt':
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=10)
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
+def _run_capture(command: str, timeout: int):
+    """Run `command` with a hard timeout. Returns (returncode, out, err, timed_out).
+
+    Never blocks past `timeout` + a short drain, because on timeout the entire
+    process tree is killed before the pipes are read.
+    """
+    use_shell = _needs_shell(command)
+    if use_shell or os.name == 'nt':
+        # On Windows a plain string is handed straight to CreateProcess, so it
+        # is already correct with shell=False -- no shlex quoting games.
+        args = command
+    else:
+        args = shlex.split(command)
+
+    proc = subprocess.Popen(
+        args,
+        shell=use_shell,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+        **_new_group_kwargs()
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        return proc.returncode, out, err, False
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        try:
+            out, err = proc.communicate(timeout=10)
+        except Exception:
+            out, err = "", ""
+        return proc.returncode, out, err, True
+
+
 @mcp.tool()
 def run_command(command: str) -> str:
     """
     Run a shell command on Fate's Windows desktop and return its output.
     Useful for checking system state, listing files, or running scripts.
     Timeout is 30 seconds. Avoid long-running or interactive commands.
+    Launching a GUI app (notepad, etc.) will time out and be killed -- use
+    run_command_bg for anything that should outlive the call.
     """
     try:
         timestamp = datetime.now().isoformat()
         print(f"[{timestamp}] run_command: {command}")
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            encoding='utf-8',
-            errors='replace'
-        )
-        if result.returncode != 0:
-            return f"Exit code {result.returncode}:\n{result.stderr}"
-        return result.stdout or "(no output)"
-    except subprocess.TimeoutExpired:
-        return "Error: command timed out after 30 seconds"
+        code, out, err, timed_out = _run_capture(command, 30)
+        if timed_out:
+            return ("Error: command timed out after 30 seconds; the process tree was killed.\n"
+                    f"{('Partial output:' + chr(10) + out) if out else ''}")
+        if code != 0:
+            return f"Exit code {code}:\n{err}"
+        return out or "(no output)"
     except Exception as e:
         return f"Exception: {e}"
 
@@ -330,16 +404,15 @@ def run_command_bg(command: str, job_id: str = "") -> str:
             f.write(f"[STARTED] {datetime.now().isoformat()}\n[CMD] {command}\n")
             f.flush()
         try:
-            result = subprocess.run(
-                command, shell=True, capture_output=True,
-                text=True, timeout=300, encoding='utf-8', errors='replace'
-            )
+            code, out, err, timed_out = _run_capture(command, 300)
             with open(output_file, 'a', encoding='utf-8') as f:
-                if result.stdout:
-                    f.write(f"[STDOUT]\n{result.stdout}\n")
-                if result.stderr:
-                    f.write(f"[STDERR]\n{result.stderr}\n")
-                f.write(f"[EXIT] {result.returncode}\n[DONE] {datetime.now().isoformat()}\n")
+                if out:
+                    f.write(f"[STDOUT]\n{out}\n")
+                if err:
+                    f.write(f"[STDERR]\n{err}\n")
+                if timed_out:
+                    f.write("[TIMEOUT] killed after 300s\n")
+                f.write(f"[EXIT] {code}\n[DONE] {datetime.now().isoformat()}\n")
         except Exception as e:
             with open(output_file, 'a', encoding='utf-8') as f:
                 f.write(f"[ERROR] {e}\n")
@@ -570,6 +643,129 @@ def get_location() -> str:
         })
     except Exception as e:
         return json.dumps({"error": str(e)})
+
+
+# ---------------------------------------------------------------------------
+# Screen + input control — registered only on a host with a real display.
+# pyautogui raises on import when there is no display (the headless server), so
+# a failure here just means these tools are not exposed on that instance rather
+# than the whole server refusing to start. Set DISABLE_GUI_TOOLS=1 to opt out
+# on a machine that *has* a display but should not be driveable remotely.
+# ---------------------------------------------------------------------------
+
+GUI_AVAILABLE = False
+try:
+    if os.getenv("DISABLE_GUI_TOOLS", "").strip() in ("1", "true", "True"):
+        raise RuntimeError("disabled via DISABLE_GUI_TOOLS")
+    import pyautogui
+    # The corner-of-screen abort would turn a stray move into a crash.
+    pyautogui.FAILSAFE = False
+    _SCREEN_W, _SCREEN_H = pyautogui.size()
+    GUI_AVAILABLE = True
+    print(f"[gui] screen + input tools ENABLED ({_SCREEN_W}x{_SCREEN_H})")
+except Exception as _e:
+    print(f"[gui] screen + input tools unavailable: {_e}")
+
+
+def _clamp(x: int, y: int):
+    """Keep coordinates on-screen so a bad number cannot fling the cursor."""
+    return max(0, min(int(x), _SCREEN_W - 1)), max(0, min(int(y), _SCREEN_H - 1))
+
+
+if GUI_AVAILABLE:
+
+    @mcp.tool()
+    def screenshot(max_width: int = 1280) -> Image:
+        """
+        Capture the current screen of this machine and return it as an image.
+        Use this to see what is actually on the display before clicking.
+        max_width: downscale so the image stays cheap to send (default 1280).
+                   Pass 0 for full native resolution.
+        """
+        img = pyautogui.screenshot()
+        if max_width and img.width > max_width:
+            ratio = max_width / img.width
+            img = img.resize((max_width, int(img.height * ratio)))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        print(f"[gui] screenshot {img.width}x{img.height}")
+        return Image(data=buf.getvalue(), format="png")
+
+    @mcp.tool()
+    def screen_info() -> str:
+        """Return this machine's screen size and current cursor position as JSON."""
+        pos = pyautogui.position()
+        return json.dumps({
+            "screen_width": _SCREEN_W,
+            "screen_height": _SCREEN_H,
+            "cursor_x": pos.x,
+            "cursor_y": pos.y,
+        })
+
+    @mcp.tool()
+    def mouse_move(x: int, y: int, duration: float = 0.2) -> str:
+        """Move the mouse to absolute screen coordinates (no click). Good for hovering."""
+        x, y = _clamp(x, y)
+        pyautogui.moveTo(x, y, duration=duration)
+        return f"Moved to ({x}, {y})"
+
+    @mcp.tool()
+    def mouse_click(x: int = -1, y: int = -1, button: str = "left", clicks: int = 1) -> str:
+        """
+        Click the mouse. If x/y are given the cursor moves there first;
+        omit them (or pass -1) to click wherever the cursor already is.
+        button: 'left', 'right', or 'middle'. clicks: 1 for single, 2 for double.
+        """
+        if button not in ("left", "right", "middle"):
+            return f"Error: invalid button '{button}' (use left/right/middle)"
+        if x >= 0 and y >= 0:
+            x, y = _clamp(x, y)
+            pyautogui.click(x=x, y=y, button=button, clicks=clicks, interval=0.1)
+            return f"{clicks}x {button} click at ({x}, {y})"
+        pyautogui.click(button=button, clicks=clicks, interval=0.1)
+        pos = pyautogui.position()
+        return f"{clicks}x {button} click at cursor ({pos.x}, {pos.y})"
+
+    @mcp.tool()
+    def mouse_drag(start_x: int, start_y: int, end_x: int, end_y: int,
+                   duration: float = 0.4, button: str = "left") -> str:
+        """Press at the start coordinates, drag to the end coordinates, release."""
+        sx, sy = _clamp(start_x, start_y)
+        ex, ey = _clamp(end_x, end_y)
+        pyautogui.moveTo(sx, sy)
+        pyautogui.dragTo(ex, ey, duration=duration, button=button)
+        return f"Dragged ({sx}, {sy}) -> ({ex}, {ey})"
+
+    @mcp.tool()
+    def mouse_scroll(clicks: int, x: int = -1, y: int = -1) -> str:
+        """Scroll the wheel. Positive clicks scroll up, negative scroll down."""
+        if x >= 0 and y >= 0:
+            x, y = _clamp(x, y)
+            pyautogui.moveTo(x, y)
+        pyautogui.scroll(clicks)
+        return f"Scrolled {clicks}"
+
+    @mcp.tool()
+    def type_text(text: str, interval: float = 0.02) -> str:
+        """Type text on the keyboard, into whatever window currently has focus."""
+        pyautogui.write(text, interval=interval)
+        return f"Typed {len(text)} chars"
+
+    @mcp.tool()
+    def press_keys(keys: str, presses: int = 1) -> str:
+        """
+        Press a key or a chord. Use '+' for combos: 'enter', 'ctrl+s',
+        'ctrl+shift+esc', 'alt+tab', 'win'. Repeat with `presses`.
+        """
+        parts = [k.strip().lower() for k in keys.split('+') if k.strip()]
+        if not parts:
+            return "Error: no keys given"
+        for _ in range(max(1, presses)):
+            if len(parts) == 1:
+                pyautogui.press(parts[0])
+            else:
+                pyautogui.hotkey(*parts)
+        return f"Pressed '{keys}' x{presses}"
 
 
 # ---------------------------------------------------------------------------
